@@ -1,0 +1,7 @@
+FROM debian:stretch
+RUN apt-get -y update && apt-get -y install ca-certificates
+WORKDIR /app
+COPY bin/serve-log /app/serve-log
+COPY index.txt /app/index.txt
+ENV RUST_BACKTRACE=1
+ENTRYPOINT ["/app/serve-log"]
