@@ -1,16 +1,24 @@
-FROM ekidd/rust-musl-builder:stable as builder
+# Using the `rust-musl-builder` as base image, instead of
+# the official Rust toolchain
+FROM clux/muslrust:nightly AS chef
+USER root
+RUN cargo install cargo-chef
+WORKDIR /app
 
-RUN USER=root cargo new --bin serve-log
-WORKDIR /home/rust/src/serve-log
-COPY ./Cargo.lock ./Cargo.lock
-COPY ./Cargo.toml ./Cargo.toml
-RUN cargo build --release
-RUN rm src/*.rs
-ADD . ./
-RUN rm ./target/x86_64-unknown-linux-musl/release/deps/serve_log*
-RUN cargo build --release
+FROM chef AS planner
+COPY . .
+RUN cargo +nightly chef prepare --recipe-path recipe.json
 
-FROM alpine:latest
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Build dependencies - this is the caching Docker layer!
+RUN cargo +nightly chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+# Build application
+COPY . .
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin serve-log
+
+FROM alpine AS runtime
+ENV RUST_BACKTRACE=1
 EXPOSE 5000
 ENV TZ=Etc/UTC \
     APP_USER=appuser
@@ -20,9 +28,8 @@ RUN apk update \
     && apk add --no-cache ca-certificates tzdata \
     && rm -rf /var/cache/apk/*
 COPY index.txt /usr/src/app/index.txt
-COPY --from=builder /home/rust/src/serve-log/target/x86_64-unknown-linux-musl/release/serve-log /usr/src/app/serve-log
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/serve-log /app/serve-log
 RUN chown -R $APP_USER:$APP_USER /usr/src/app
 USER $APP_USER
-WORKDIR /usr/src/app
-
-CMD ["./serve-log"]
+WORKDIR /app
+CMD ["/app/serve-log"]

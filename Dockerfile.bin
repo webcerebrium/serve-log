@@ -1,4 +1,4 @@
-FROM debian:stretch
+FROM debian
 RUN apt-get -y update && apt-get -y install ca-certificates
 WORKDIR /app
 COPY bin/serve-log /app/serve-log

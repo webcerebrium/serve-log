@@ -1,90 +1,156 @@
-use actix_web::web::{BytesMut, Payload};
-use actix_web::{error, Error, HttpRequest};
-use futures::StreamExt; // provides implementation for web::Payload.next()
+mod cli;
+mod logging;
 
-mod server {
-    pub fn get_bind_address() -> String {
-        std::env::var("BIND_ADDR")
-            .ok()
-            .unwrap_or("0.0.0.0:5000".to_owned())
-    }
+use axum::body::*;
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::*;
+use axum::Router;
+use clap::Parser;
+use std::path::{Path, PathBuf};
+use tower_http::classify::*;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::services::ServeFile;
+use tower_http::trace::*;
+use tracing::*;
 
-    pub fn get_web_root() -> String {
-        std::env::var("WEB_ROOT").ok().unwrap_or("./".to_owned())
-    }
-
-    pub fn get_cors_factory() -> actix_cors::CorsFactory {
-        actix_cors::Cors::new()
-            .allowed_methods(vec!["GET", "POST"])
-            .allowed_headers(vec![
-                actix_web::http::header::CONTENT_TYPE,
-                actix_web::http::header::ACCEPT,
-            ])
-            .max_age(36000)
-            .finish()
-    }
+#[derive(Clone)]
+struct AppState {
+    web_root: PathBuf,
 }
 
-pub async fn get_payload_str(mut payload: Payload) -> Result<String, Error> {
-    // reading payload: pretty low level works for error handler
-    let mut bytes = BytesMut::new();
-    while let Some(chunk) = payload.next().await {
-        let chunk = chunk?;
-        // limit max size of in-memory payload
-        if (bytes.len() + chunk.len()) > 4 * 16386 {
-            return Err(error::ErrorBadRequest("overflow"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let body_str = std::str::from_utf8(&bytes)?;
-    return Ok(String::from(body_str));
-}
-
-async fn index(req: HttpRequest, payload: Payload) -> Result<actix_files::NamedFile, Error> {
-    println!("\n{} {:#?} {}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"), req.method(), req.path());
+async fn middleware_handler(
+    State(state): State<AppState>,
+    req: Request,
+    _: Next,
+) -> impl IntoResponse {
+    let uri = req.uri();
+    let path = uri.path();
+    println!(
+        "\n{} {:#?} {}",
+        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+        req.method(),
+        path,
+    );
     let headers = req.headers().clone();
     for (k, v) in headers.iter() {
         println!("  H {:?}: {:?}", k, v);
     }
-    if req.query_string().as_bytes().len() > 0 {
-        println!("  Q {:#?}", req.query_string());
+    if let Some(q) = uri.query() {
+        println!("  Q {:#?}", q);
     }
-    match get_payload_str(payload).await {
-        Ok(payload) => {
-            if payload.len() > 0 {
-                println!("PAYLOAD:\n---\n{}\n---", payload.as_str());
+
+    if req.method() != Method::GET
+        && req.method() != Method::HEAD
+        && req.method() != Method::OPTIONS
+    {
+        let payload = get_payload(req.into_body()).await;
+        if !payload.is_empty() {
+            println!("PAYLOAD:\n---\n{}\n---", String::from_utf8_lossy(&payload));
+        }
+    } else {
+        let file_path = state.web_root.join(path);
+        if std::path::Path::new(&file_path).exists() {
+            // serve path
+            let mut service = ServeFile::new(&file_path);
+            match service.try_call(req).await {
+                Ok(res) => {
+                    if res.status() == 200 {
+                        return res.into_response();
+                    } else {
+                        return "OOOK".into_response();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("ERROR: {}", e);
+                    return "ERROR".into_response();
+                }
             }
         }
-        Err(errp) => println!("PAYLOAD ERROR: {:?}", errp),
     }
-    let src: String = server::get_web_root() + "/" + String::from("index.txt").as_str();
-    let fallback: String = server::get_web_root() + "/index.txt";
-    let found: bool = std::path::Path::new(&src).exists();
-    let file = actix_files::NamedFile::open(if found { &src } else { &fallback })?;
-    Ok(file.use_last_modified(true))
+    "OK".into_response()
 }
 
-#[actix_rt::main]
-async fn main() -> std::io::Result<()> {
-    std::env::set_var("RUST_LOG", "actix_web=info");
-    env_logger::init();
+pub async fn nop() -> impl IntoResponse {
+    println!("NOP");
+    "unreachable".into_response()
+}
 
-    println!(
-        "Starting server at http://{}/, static files root at {}",
-        server::get_bind_address(),
-        server::get_web_root()
-    );
-    actix_web::HttpServer::new(|| {
-        actix_web::App::new()
-            .wrap(actix_web::middleware::Logger::default())
-            .wrap(server::get_cors_factory())
-            .route("/.*", actix_web::web::post().to(index))
-            .route("/.*", actix_web::web::get().to(index))
-            .route("/", actix_web::web::post().to(index))
-            .route("/", actix_web::web::get().to(index))
-    })
-    // .workers(1)
-    .bind(server::get_bind_address())?
-    .run()
-    .await
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    logging::start_with_timings("INFO");
+    let opts = cli::Cli::parse();
+    let state = AppState {
+        web_root: Path::new(&opts.web_root).to_path_buf(),
+    };
+
+    let app = Router::new()
+        .route("/*path", axum::routing::get(nop))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware_handler,
+        ))
+        .with_state(state)
+        .layer(axum_body_limit(1024 * 1024))
+        .layer(axum_trace_full())
+        .layer(axum_cors_any());
+    axum_serve(&opts.bind_addr, app).await
+}
+
+// axum layer for tracing logs
+pub fn axum_trace_full() -> TraceLayer<SharedClassifier<ServerErrorsAsFailures>> {
+    TraceLayer::new_for_http()
+        .make_span_with(
+            DefaultMakeSpan::new()
+                .level(Level::DEBUG)
+                .include_headers(true),
+        )
+        .on_request(DefaultOnRequest::new().level(Level::TRACE))
+        .on_response(
+            DefaultOnResponse::new()
+                .level(Level::DEBUG)
+                .include_headers(true),
+        )
+}
+
+// axum layer for CORS
+pub fn axum_cors_any() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+// axum layer for payload body limit
+pub fn axum_body_limit(limit: usize) -> RequestBodyLimitLayer {
+    RequestBodyLimitLayer::new(limit)
+}
+
+// start
+pub async fn axum_serve(listen: &str, app: axum::Router) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
+    println!("Listening on {}", listen,);
+    axum::serve(listener, app).await.unwrap();
+    Ok(())
+}
+
+#[instrument(level = "debug")]
+pub fn text200(
+    message: impl Into<String> + std::fmt::Display + std::fmt::Debug,
+) -> impl IntoResponse {
+    (StatusCode::OK, message.to_string()).into_response()
+}
+
+async fn get_payload<B>(body: B) -> Bytes
+where
+    B: axum::body::HttpBody<Data = Bytes>,
+    B::Error: std::fmt::Display,
+{
+    use http_body_util::BodyExt;
+    match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => Bytes::from(vec![]),
+    }
 }
